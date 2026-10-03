@@ -1,18 +1,38 @@
 /* 事故复盘因果图 —— 原生 JS 客户端
  *
- * 本地维护一份"工作图"(S.work)，所有编辑先落在本地并累计到 changeset；
- * 点「提交一组修改」后整包发给 /api/changes/commit，后端在一个事务里
- * 校验整张图（含成环检测），任一不通过则整批拒绝。
+ * 所有进入画布的图（服务端当前版 / 历史快照 / 未提交 changeset / 提案预览 /
+ * 三方合并预览 / 重复事件归并预览）都先在 projection.js 中生成**不可变图投影**：
+ * 带来源版本（version_id + source）、只读标记（readonly）与稳定 ID 顺序；
+ * 时间窗、证据审查、反事实推演、下游高亮等派生计算只接受投影。
+ *
+ * 工作图 S.work 仍是编辑草稿（所有编辑先落本地并累计到 changeset），每次渲染由
+ * rebuildWorkProjection() 生成 source='work' 的可写投影；进入历史 / 预览只读图时
+ * 先 captureEditSession() 原子保存工作图 / changeset / 选中项 / 沙盘 / 高亮，
+ * 退出 / 返回 / 请求失败时 restoreEditSession() 一次性还原——预览数据永不落工作图。
  */
 'use strict';
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 const NODE_W = 176, NODE_H = 56, PORT_R = 6;
 
+// 与后端同构的纯计算与会话原子快照 / 恢复均收敛在不可变投影层
+const {
+  make: makeProjection,
+  computeTimeWindows,
+  computeEvidenceReview,
+  computeCounterfactual,
+  downstreamOf: projectionDownstream,
+  emptyChangeSet,
+  captureSession,
+  restoreSession,
+} = Projection;
+
 const S = {
-  committed: null,        // 服务器当前快照 {version_id, nodes:[], edges:[]}
-  work: null,             // 工作图 {version_id, nodes:Map, edges:Map}（Map 保序）
-  changes: newChangeSet(),
+  committed: null,        // 服务器当前快照（原始响应 {version_id, nodes:[], edges:[]}）
+  work: null,             // 工作图草稿 {version_id, nodes:Map, edges:Map}（Map 保序）
+  changes: emptyChangeSet(),
+  projection: null,       // 当前画布的不可变投影（work / 历史 / 三类预览统一入口）
+  roSession: null,        // 非 null 时处于只读视图：进入前的编辑会话原子快照
   selected: null,         // {kind:'node'|'edge', id}
   view: { x: 40, y: 30, k: 1 },
   addType: 'event',
@@ -23,7 +43,7 @@ const S = {
   affected: { nodes: new Set(), edges: new Set() },
   conflictHits: { nodes: new Set(), edges: new Set(), data: null },  // 服务端返回的时间窗冲突链
   localConflictHits: { nodes: new Set(), edges: new Set(), data: null },  // 未提交工作图上的即时冲突
-  localReviews: null,       // 未提交工作图上实时重算的证据强度审查（Map），干净视图用服务端结果
+  _cycleHits: new Set(),  // 服务端返回的成环路径高亮
   // 反事实干预沙盘（只读）：active=面板是否已配置推演；result=最近一次推演结果
   sandbox: {
     active: false,
@@ -39,29 +59,32 @@ const S = {
 
 function emptyHits() { return { nodes: new Set(), edges: new Set(), data: null }; }
 
-/** 规范化节点：旧快照可能没有 trigger_mode，事件节点按默认 ANY。 */
-function normalizeNode(n) {
-  if (n.type === 'event' && n.trigger_mode !== 'ANY' && n.trigger_mode !== 'ALL') n.trigger_mode = 'ANY';
-  if (n.type === 'evidence' && n.trigger_mode === undefined) n.trigger_mode = null;
-  return n;
+/** 由工作图草稿生成未提交工作图投影（source='work'，可写标记；稳定 ID 顺序）。 */
+function rebuildWorkProjection() {
+  S.projection = makeProjection({
+    nodes: [...S.work.nodes.values()],
+    edges: [...S.work.edges.values()],
+    version_id: S.work.version_id,
+    source: 'work',
+    readonly: false,
+  });
+  return S.projection;
 }
 
+/** 当前画布活动投影（渲染 / 派生计算的唯一图数据来源）。 */
+const activeProjection = () => S.projection;
+
 function recomputeLocalConflict() {
-  if (isReadOnly() || !S.work) { S.localConflictHits = emptyHits(); return; }
-  const { conflict } = computeTimeWindows(S.work.nodes, S.work.edges);
+  if (isReadOnly() || !S.projection) { S.localConflictHits = emptyHits(); return; }
+  const { conflict } = computeTimeWindows(S.projection);
   S.localConflictHits = conflict
     ? { nodes: new Set(conflict.chain_node_ids), edges: new Set(conflict.chain_edge_ids), data: conflict }
     : emptyHits();
 }
 
-function newChangeSet() {
-  return { node_creates: [], node_updates: [], node_deletes: [],
-           edge_creates: [], edge_updates: [], edge_deletes: [] };
-}
-
-// 只读模式：历史版本浏览，或提案 / 合并结果预览
+// 只读模式：历史版本浏览，或提案 / 合并 / 归并预览（由投影只读标记与视图状态共同判定）
 const isReadOnly = () => !!S.viewingVersion || !!S.preview;
-// 本地脏工作图（非只读且有未提交修改）——时间窗 / 证据审查 / 沙盘据此走前端同构重算
+// 本地脏工作图（非只读且有未提交修改）——时间窗 / 证据审查 / 沙盘走 work 投影本地重算
 const isDirtyEditing = () => !isReadOnly() && changeCount() > 0;
 
 // ---------- 时间窗工具 ----------
@@ -123,10 +146,12 @@ async function api(path, opts = {}) {
 // ---------- 数据装载 ----------
 
 function snapshotFromServer(g) {
+  // 工作图草稿：节点仍经投影层同一套 normalize（默认 trigger_mode / 字段缺失补齐）
+  const p = makeProjection({ ...g, source: 'server' });
   return {
-    version_id: g.version_id,
-    nodes: new Map(g.nodes.map((n) => [n.id, normalizeNode({ ...n })])),
-    edges: new Map(g.edges.map((e) => [e.id, { ...e }])),
+    version_id: p.version_id,
+    nodes: new Map([...p.nodes.values()].map((n) => [n.id, { ...n }])),
+    edges: new Map([...p.edges.values()].map((e) => [e.id, { ...e }])),
   };
 }
 
@@ -134,15 +159,18 @@ async function loadState() {
   const g = await api('/api/state');
   S.committed = g;
   S.work = snapshotFromServer(g);
-  S.changes = newChangeSet();
+  S.changes = emptyChangeSet();
   S.selected = null;
   S.viewingVersion = null;
   S.preview = null;
+  S.roSession = null;
   S.mergeHits = { nodes: new Set(), edges: new Set() };
   S.nodeMerge = null;
   S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
+  S._cycleHits = new Set();
   clearAffected();
   resetSandbox();
+  rebuildWorkProjection();
   renderAll();
   await refreshVersions();
   void loadReviews();
@@ -280,18 +308,20 @@ function deleteSelected() {
 function afterLocalEdit() {
   clearAffected();
   S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
+  rebuildWorkProjection();
   renderAll();
 }
 
 function discardChanges() {
   if (!changeCount()) return;
   S.work = snapshotFromServer(S.committed);
-  S.changes = newChangeSet();
+  S.changes = emptyChangeSet();
   S.selected = null;
   clearAffected();
   hideError();
+  rebuildWorkProjection();
   renderAll();
-  // 放弃未提交后沙盘需回到「按当前版本服务端推演」的结果
+  // 放弃未提交后沙盘在新的工作投影上即时重算
   if (S.sandbox.active && S.sandbox.targetId) void syncSandbox();
   toast('已放弃全部未提交修改');
 }
@@ -310,10 +340,11 @@ function anchorPoint(node, side) {
     : { x: node.pos_x, y: node.pos_y + NODE_H / 2 };
 }
 
-/** 计算从源节点右边缘到目标节点矩形边缘的起止点 */
+/** 计算从源节点右边缘到目标节点矩形边缘的起止点（节点坐标取活动投影） */
 function edgeEndpoints(e) {
-  const src = S.work.nodes.get(e.source_id);
-  const dst = S.work.nodes.get(e.target_id);
+  const p = activeProjection();
+  const src = p.nodes.get(e.source_id);
+  const dst = p.nodes.get(e.target_id);
   if (!src || !dst) return null;
   const sc = { x: src.pos_x + NODE_W / 2, y: src.pos_y + NODE_H / 2 };
   const dc = { x: dst.pos_x + NODE_W / 2, y: dst.pos_y + NODE_H / 2 };
@@ -338,175 +369,25 @@ function edgePath(e) {
   return `M ${p1.x} ${p1.y} C ${p1.x + dx} ${p1.y}, ${p2.x - dx} ${p2.y}, ${p2.x} ${p2.y}`;
 }
 
-// ---------- 时间窗传播（与后端 graph.compute_time_windows 同构） ----------
-// 每条 causes 边表示源事件不晚于目标事件：
-//   有效下界 = max(自身与全部祖先的 earliest)，有效上界 = min(自身与全部后代的 latest)。
-function computeTimeWindows(nodes, edges) {
-  const events = [...nodes.values()].filter((n) => n.type === 'event').map((n) => n.id);
-  const evSet = new Set(events);
-  const adj = new Map(events.map((id) => [id, []]));
-  const radj = new Map(events.map((id) => [id, []]));
-  const pairEdge = new Map();
-  const indeg = new Map(events.map((id) => [id, 0]));
-  for (const e of edges.values()) {
-    if (e.kind !== 'causes' || !evSet.has(e.source_id) || !evSet.has(e.target_id)) continue;
-    adj.get(e.source_id).push(e.target_id);
-    radj.get(e.target_id).push(e.source_id);
-    indeg.set(e.target_id, indeg.get(e.target_id) + 1);
-    pairEdge.set(`${e.source_id}->${e.target_id}`, e.id);
-  }
-  const q0 = events.filter((id) => indeg.get(id) === 0);
-  const topo = [];
-  while (q0.length) {
-    const u = q0.shift(); topo.push(u);
-    for (const v of adj.get(u)) {
-      indeg.set(v, indeg.get(v) - 1);
-      if (indeg.get(v) === 0) q0.push(v);
-    }
-  }
-  const hasCycle = topo.length !== events.length;
+// ---------- 派生计算路由（时间窗 / 证据审查：纯计算在 projection.js，只接受活动投影） ----------
 
-  const lb = new Map(), lbSrc = new Map(), lbPath = new Map();
-  for (const id of topo) {
-    const t = nodes.get(id).earliest_time || null;
-    lb.set(id, t); lbSrc.set(id, t ? id : null); lbPath.set(id, t ? [id] : []);
-  }
-  for (const u of topo) {
-    if (!lb.get(u)) continue;
-    for (const v of adj.get(u)) {
-      if (lb.get(v) == null || lb.get(u) > lb.get(v)) {
-        lb.set(v, lb.get(u)); lbSrc.set(v, lbSrc.get(u));
-        lbPath.set(v, [...lbPath.get(u), v]);
-      }
-    }
-  }
-  const ub = new Map(), ubSrc = new Map(), ubPath = new Map();
-  for (const id of topo) {
-    const t = nodes.get(id).latest_time || null;
-    ub.set(id, t); ubSrc.set(id, t ? id : null); ubPath.set(id, t ? [id] : []);
-  }
-  for (let i = topo.length - 1; i >= 0; i--) {
-    const v = topo[i];
-    if (!ub.get(v)) continue;
-    for (const u of radj.get(v)) {
-      if (ub.get(u) == null || ub.get(v) < ub.get(u)) {
-        ub.set(u, ub.get(v)); ubSrc.set(u, ubSrc.get(v));
-        ubPath.set(u, [u, ...ubPath.get(v)]);
-      }
-    }
-  }
-
-  const windows = new Map();
-  let conflict = null;
-  for (const id of topo) {
-    windows.set(id, {
-      lower: lb.get(id), upper: ub.get(id),
-      lowerSrc: lbSrc.get(id), upperSrc: ubSrc.get(id),
-      lowerChain: lbPath.get(id), upperChain: ubPath.get(id),
-    });
-    if (!conflict && lb.get(id) != null && ub.get(id) != null && lb.get(id) > ub.get(id)) {
-      const chain = [];
-      for (const x of [...lbPath.get(id), ...ubPath.get(id)]) if (!chain.includes(x)) chain.push(x);
-      const chainEdges = [];
-      for (let k = 0; k < chain.length - 1; k++) {
-        const eid = pairEdge.get(`${chain[k]}->${chain[k + 1]}`);
-        if (eid) chainEdges.push(eid);
-      }
-      conflict = {
-        node_id: id, lower_bound: lb.get(id), upper_bound: ub.get(id),
-        lower_node_id: lbSrc.get(id), upper_node_id: ubSrc.get(id),
-        chain_node_ids: chain, chain_edge_ids: chainEdges,
-      };
-    }
-  }
-  return { windows, conflict, hasCycle };
-}
-
-/** 当前工作图上的传播结果（未提交时实时反映本地编辑）。 */
+/** 当前活动投影上的时间窗传播（脏工作图 / 干净当前版 / 历史 / 三类预览同一路径）。 */
 function currentTimeInfo() {
-  return computeTimeWindows(S.work.nodes, S.work.edges);
+  return computeTimeWindows(activeProjection());
 }
 
-/** 选中事件实际展示的有效时间窗：历史/干净视图用服务端，脏工作图用本地重算。 */
+/** 选中事件实际展示的有效时间窗：一律由活动投影计算（不读服务端预算字段）。 */
 function eventWindowFor(nodeId) {
-  const n = S.work.nodes.get(nodeId);
-  if (!n || n.type !== 'event') return null;
-  if (isDirtyEditing()) {
-    return currentTimeInfo().windows.get(nodeId) || null;
-  }
-  return n.time_window || null;  // 历史版本 / 提案预览均由服务端按所看图重算
+  const p = activeProjection();
+  if (!p || !p.hasNode(nodeId) || p.nodes.get(nodeId).type !== 'event') return null;
+  return currentTimeInfo().windows.get(nodeId) || null;
 }
 
-// ---------- 证据强度审查（与后端 graph.compute_evidence_review 同构） ----------
-// 同一 source_group 在每个方向只采用 reliability 最高的一条，其余同源未计权；
-// 独立组分别按 S=1-∏(1-r)、R=1-∏(1-r) 聚合；S/R≥0.6 判争议，S≥0.7 判支持，R≥0.7 判反驳。
-const DISPUTE_MIN = 0.6, STRENGTH_MIN = 0.7, REV_EPS = 1e-12;
-
-function computeEvidenceReview(nodes, edges) {
-  // eventId -> { supports: Map<bucketKey, entries>, refutes: Map<bucketKey, entries> }
-  // bucketKey：命名组用 source_group；未分组证据各自独立，用节点 id 作为桶键。
-  const buckets = new Map();
-  for (const e of edges.values()) {
-    if (e.kind !== 'supports' && e.kind !== 'refutes') continue;
-    const ev = nodes.get(e.source_id), event = nodes.get(e.target_id);
-    if (!ev || !event || ev.type !== 'evidence' || event.type !== 'event') continue;
-    if (!buckets.has(event.id)) buckets.set(event.id, { supports: new Map(), refutes: new Map() });
-    const gm = buckets.get(event.id)[e.kind];
-    // 命名组桶键为字符串；未分组证据各自独立，用对象哨兵作桶键（与字符串不会碰撞）
-    const key = ev.source_group || { independent: ev.id };
-    if (!gm.has(key)) gm.set(key, []);
-    gm.get(key).push({
-      node_id: ev.id, edge_id: e.id, title: ev.title,
-      reliability: ev.reliability ?? 0,
-      reliability_set: ev.reliability != null,
-      source_group: ev.source_group || null,
-    });
-  }
-  const agg = (ws) => Math.round((1 - ws.reduce((v, r) => v * (1 - r), 1)) * 10000) / 10000;
-  const reviews = new Map();
-  for (const n of nodes.values()) {
-    if (n.type !== 'event') continue;
-    const dirMap = buckets.get(n.id);
-    const groups = [], sWs = [], rWs = [];
-    if (dirMap) {
-      for (const direction of ['supports', 'refutes']) {
-        const gm = dirMap[direction];
-        // 命名组按组名排序，独立证据桶按节点 id 排序并统一排最后，与后端输出顺序一致
-        const namedKeys = [...gm.keys()].filter((k) => typeof k === 'string').sort();
-        const indepKeys = [...gm.keys()].filter((k) => typeof k === 'object')
-          .sort((a, b) => (a.independent < b.independent ? -1 : a.independent > b.independent ? 1 : 0));
-        for (const key of [...namedKeys, ...indepKeys]) {
-          const entries = gm.get(key);
-          // 组内取 reliability 最高者；并列取较小节点 id，保证与后端一致
-          const winner = entries.reduce((a, b) =>
-            (b.reliability > a.reliability
-              || (b.reliability === a.reliability && b.node_id < a.node_id)) ? b : a);
-          const dropped = entries.filter((x) => x.edge_id !== winner.edge_id);
-          (direction === 'supports' ? sWs : rWs).push(winner.reliability);
-          groups.push({ group: winner.source_group, direction, selected: winner, unweighted: dropped });
-        }
-      }
-    }
-    const s = agg(sWs), r = agg(rWs);
-    const status = (s >= DISPUTE_MIN - REV_EPS && r >= DISPUTE_MIN - REV_EPS) ? 'disputed'
-      : s >= STRENGTH_MIN - REV_EPS ? 'supported'
-      : r >= STRENGTH_MIN - REV_EPS ? 'refuted' : 'insufficient';
-    reviews.set(n.id, {
-      support_score: s, refute_score: r, status, groups,
-      selected_evidence: groups.map((g) => g.selected),
-      unweighted_evidence: groups.flatMap((g) =>
-        g.unweighted.map((x) => ({ ...x, reason: 'same_source', group: g.group, direction: g.direction }))),
-    });
-  }
-  return reviews;
-}
-
-/** 选中事件实际展示的审查结果：脏工作图用本地重算，否则用服务端按所查看版本算好的。 */
+/** 当前活动投影上的证据强度审查（投影内缓存）。 */
 function reviewFor(nodeId) {
-  const n = S.work.nodes.get(nodeId);
-  if (!n || n.type !== 'event') return null;
-  if (S.localReviews) return S.localReviews.get(nodeId) || null;
-  return n.evidence_review || null;
+  const p = activeProjection();
+  if (!p || !p.hasNode(nodeId) || p.nodes.get(nodeId).type !== 'event') return null;
+  return computeEvidenceReview(p).get(nodeId) || null;
 }
 
 const STATUS_META = {
@@ -524,21 +405,16 @@ function applyView() {
 
 function renderAll() {
   recomputeLocalConflict();
-  // 未提交工作图：证据强度审查实时重算；干净视图 / 历史快照用服务端按各自版本算好的结果
-  S.localReviews = isDirtyEditing()
-    ? computeEvidenceReview(S.work.nodes, S.work.edges) : null;
   // 先同步沙盘控件（结构变化时重建列表并丢弃过期依据树），再按需本地即时推演
   pruneSandboxSelection();
   renderSandboxControls();
   renderPkgControls();
   renderNodeMergeControls();
-  if (!S.sandbox.active) {
-    $('sandboxResult').innerHTML =
-      '<p class="muted small">选择目标并勾选干预点后即时推演；未提交工作图即时生效。</p>';
-  } else if (sandboxIsLocal() && S.sandbox.targetId) {
+  if (S.sandbox.active && S.sandbox.targetId) {
+    // 沙盘对任何活动投影（未提交工作图 / 历史 / 三类预览）都在投影上本地同构推演
     try {
-      S.sandbox.result = computeCounterfactual(S.work.nodes, S.work.edges,
-        S.sandbox.targetId, [...S.sandbox.prevented]);
+      S.sandbox.result = computeCounterfactual(
+        activeProjection(), null, S.sandbox.targetId, [...S.sandbox.prevented]);
       S.sandbox.local = true;
     } catch (_) { /* 非法结构（如成环）时沿用上一次结果 */ }
   }
@@ -553,7 +429,7 @@ function renderAll() {
 function renderHeader() {
   const label = S.viewingVersion ? `只读 v${S.viewingVersion}`
     : S.preview ? S.preview.badge || '提案预览'
-    : `v${S.work.version_id}`;
+    : `v${S.projection.version_id}`;
   $('versionBadge').textContent = label;
   const n = changeCount();
   $('dirtyCount').textContent = (!isReadOnly() && n) ? `● ${n} 项未提交` : '';
@@ -580,18 +456,21 @@ function renderHeader() {
 
 function renderNodes() {
   nodeLayer.innerHTML = '';
-  const local = isDirtyEditing() ? currentTimeInfo() : null;
+  const p = activeProjection();
+  // 时间窗一律由活动投影计算（稳定 ID 顺序遍历）
+  const twAll = currentTimeInfo();
   // 沙盘依据树节点集合整帧只算一次
   const cfTree = (S.sandbox.active && S.sandbox.result) ? cfTreeNodeIds() : null;
-  for (const n of S.work.nodes.values()) {
+  const editing = !isReadOnly();
+  for (const n of p.nodes.values()) {
     const g = el('g', { class: `node ${n.type}`, transform: `translate(${n.pos_x},${n.pos_y})` });
     g.dataset.nodeId = n.id;
     if (S.selected?.kind === 'node' && S.selected.id === n.id) g.classList.add('selected');
-    if (dirtyNodeIds().has(n.id)) g.classList.add('dirty');
+    if (editing && dirtyNodeIds().has(n.id)) g.classList.add('dirty');
     if (S.affected.nodes.has(n.id)) g.classList.add('affected');
     if (S.mergeHits.nodes.has(n.id)) g.classList.add('merge-hit');
     if (S.nodeMerge?.nodes?.has(n.id)) g.classList.add('merge-hit');
-    if (window._cycleHits?.has(n.id)) g.classList.add('cycle-hit');
+    if (S._cycleHits.has(n.id)) g.classList.add('cycle-hit');
     if (S.conflictHits.nodes.has(n.id) || S.localConflictHits.nodes.has(n.id)) {
       g.classList.add('conflict-hit');
     }
@@ -609,9 +488,8 @@ function renderNodes() {
     g.appendChild(el('text', { class: 'node-title', x: 10, y: 34 }, trunc(n.title, 14)));
 
     if (n.type === 'event') {
-      const tw = (local ? local.windows.get(n.id) : n.time_window) || {};
-      const lo = local ? tw.lower : tw.effective_lower;
-      const hi = local ? tw.upper : tw.effective_upper;
+      const tw = twAll.windows.get(n.id) || {};
+      const lo = tw.lower, hi = tw.upper;
       if (lo || hi) {
         g.appendChild(el('text', { class: 'node-time', x: 10, y: 52 },
           `${fmtTimeShort(lo)}–${fmtTimeShort(hi)} UTC`));
@@ -647,8 +525,9 @@ function renderNodes() {
 
 function renderEdges() {
   edgeLayer.innerHTML = '';
-  const dirty = dirtyEdgeIds();
-  for (const e of S.work.edges.values()) {
+  const editing = !isReadOnly();
+  const dirty = editing ? dirtyEdgeIds() : new Set();
+  for (const e of activeProjection().edges.values()) {
     const g = el('g', { class: `edge ${e.kind}` });
     g.dataset.edgeId = e.id;
     if (S.selected?.kind === 'edge' && S.selected.id === e.id) g.classList.add('selected');
@@ -837,30 +716,24 @@ function bindEvidenceEditor(nodeId) {
   });
 }
 
-/** 有效时间窗展示；tw 可能是服务端结构（effective_lower/lower_source/lower_chain）
- *  或本地结构（lower/lowerSrc/lowerChain）。 */
+/** 有效时间窗展示：tw 为投影层计算结果（lower/upper/lowerSrc/lowerChain）。
+ *  所有视图（当前版 / 未提交 / 历史 / 三类预览）统一口径，均按活动投影重算。 */
 function effectiveWindowHtml(nodeId, tw) {
-  const local = isDirtyEditing();
-  const lo = local ? tw.lower : tw.effective_lower;
-  const hi = local ? tw.upper : tw.effective_upper;
-  const loSrcId = local ? tw.lowerSrc : tw.lower_source?.node_id;
-  const hiSrcId = local ? tw.upperSrc : tw.upper_source?.node_id;
-  const loSrcTitle = local
-    ? (loSrcId ? S.work.nodes.get(loSrcId)?.title : null)
-    : tw.lower_source?.title;
-  const hiSrcTitle = local
-    ? (hiSrcId ? S.work.nodes.get(hiSrcId)?.title : null)
-    : tw.upper_source?.title;
-  const note = local
+  const lo = tw.lower, hi = tw.upper;
+  const loSrcId = tw.lowerSrc, hiSrcId = tw.upperSrc;
+  const p = activeProjection();
+  const loSrcTitle = loSrcId ? p.nodes.get(loSrcId)?.title : null;
+  const hiSrcTitle = hiSrcId ? p.nodes.get(hiSrcId)?.title : null;
+  const note = isDirtyEditing()
     ? '<p class="muted small">基于未提交工作图实时重算。</p>'
-    : (isReadOnly() ? '<p class="muted small">按所查看的只读图（历史版本 / 提案预览）重算。</p>'
+    : (isReadOnly() ? '<p class="muted small">按所查看的只读图（历史快照 / 提案 / 合并 / 归并预览）投影重算。</p>'
                         : '<p class="muted small">已按整图传播：下界取自身与祖先最大，上界取自身与后代最小。</p>');
-  const localConflict = local && lo != null && hi != null && lo > hi
+  const localConflict = isDirtyEditing() && lo != null && hi != null && lo > hi
     ? S.localConflictHits.data : null;
   const conflictHtml = localConflict ? `
     <div class="window-conflict">
       ⚠ 下界晚于上界，提交将被整批回滚。冲突链：
-      ${localConflict.chain_node_ids.map((id) => esc(S.work.nodes.get(id)?.title || id)).join(' → ')}
+      ${localConflict.chain_node_ids.map((id) => esc(p.nodes.get(id)?.title || id)).join(' → ')}
     </div>` : '';
   const boundLine = (label, val, srcId, srcTitle) => {
     if (val == null) return `<div class="kv">${label}：<b>不限</b></div>`;
@@ -880,7 +753,7 @@ function effectiveWindowHtml(nodeId, tw) {
     </div>`;
 }
 
-/** 证据强度审查展示；rv 为服务端或本地 computeEvidenceReview 的同构结果。 */
+/** 证据强度审查展示；rv 为投影层 computeEvidenceReview 的结果（任意视图同构）。 */
 function evidenceReviewHtml(rv) {
   const local = isDirtyEditing();
   const [label, cls] = STATUS_META[rv.status] || [rv.status, 'insufficient'];
@@ -928,8 +801,10 @@ function renderDetail() {
   }
   const readOnly = isReadOnly();
   if (S.selected.kind === 'node') {
-    const n = S.work.nodes.get(S.selected.id);
+    // 详情展示读活动投影（只读视图即预览 / 历史节点）；编辑写工作图草稿
+    const n = activeProjection().nodes.get(S.selected.id);
     if (!n) { S.selected = null; return renderDetail(); }
+    const draft = readOnly ? null : S.work.nodes.get(n.id);
     h.textContent = '节点详情';
     const isEvent = n.type === 'event';
     const tw = eventWindowFor(n.id);
@@ -949,11 +824,11 @@ function renderDetail() {
       </div>`;
     $('dTitle').addEventListener('change', (ev) => {
       const v = ev.target.value.trim();
-      if (!v) { ev.target.value = n.title; return; }
-      n.title = v; stageNodeUpdate(n.id, { title: v }); afterLocalEdit();
+      if (!v) { ev.target.value = draft.title; return; }
+      draft.title = v; stageNodeUpdate(n.id, { title: v }); afterLocalEdit();
     });
     $('dDesc').addEventListener('change', (ev) => {
-      n.description = ev.target.value; stageNodeUpdate(n.id, { description: ev.target.value }); afterLocalEdit();
+      draft.description = ev.target.value; stageNodeUpdate(n.id, { description: ev.target.value }); afterLocalEdit();
     });
     if (isEvent) { bindTimeEditor(n.id); bindTriggerModeEditor(n.id); }
     else bindEvidenceEditor(n.id);
@@ -965,9 +840,10 @@ function renderDetail() {
     $('btnDelete')?.addEventListener('click', deleteSelected);
     $('btnImpact')?.addEventListener('click', () => computeImpact(n.id));
   } else {
-    const e = S.work.edges.get(S.selected.id);
+    const e = activeProjection().edges.get(S.selected.id);
     if (!e) { S.selected = null; return renderDetail(); }
-    const src = S.work.nodes.get(e.source_id), dst = S.work.nodes.get(e.target_id);
+    const p = activeProjection();
+    const src = p.nodes.get(e.source_id), dst = p.nodes.get(e.target_id);
     const isEvidenceEdge = e.kind === 'supports' || e.kind === 'refutes';
     const kindLabel = e.kind === 'causes' ? '因果 causes'
       : e.kind === 'supports' ? '证据支持 supports' : '证据反驳 refutes';
@@ -988,7 +864,9 @@ function renderDetail() {
       <div class="detail-actions">
         <button class="btn btn-small btn-danger" id="btnDelete" ${readOnly ? 'disabled' : ''}>删除连线</button>
       </div>`;
+    const draftEdge = readOnly ? null : S.work.edges.get(e.id);
     $('dKind')?.addEventListener('change', (ev) => {
+      if (readOnly) return;  // 只读投影：预览 / 历史数据绝不写回工作图
       const kind = ev.target.value;
       if ([...S.work.edges.values()].some((x) => x.id !== e.id
         && x.source_id === e.source_id && x.target_id === e.target_id && x.kind === kind)) {
@@ -996,12 +874,13 @@ function renderDetail() {
         ev.target.value = e.kind;
         return;
       }
-      e.kind = kind;
+      draftEdge.kind = kind;
       stageEdgeUpdate(e.id, { kind });
       afterLocalEdit();
     });
     $('dLabel').addEventListener('change', (ev) => {
-      e.label = ev.target.value; stageEdgeUpdate(e.id, { label: ev.target.value }); afterLocalEdit();
+      if (readOnly) return;
+      draftEdge.label = ev.target.value; stageEdgeUpdate(e.id, { label: ev.target.value }); afterLocalEdit();
     });
     $('btnDelete').addEventListener('click', deleteSelected);
   }
@@ -1038,7 +917,7 @@ function showError(err) {
       data: c,
     };
     const chain = (c.chain_node_ids || [])
-      .map((id) => S.work.nodes.get(id)?.title || id).join(' → ');
+      .map((id) => activeProjection()?.nodes.get(id)?.title || S.work.nodes.get(id)?.title || id).join(' → ');
     $('errorText').textContent =
       `事务已回滚：${err.message}（下界 ${c.lower_bound} ↔ 上界 ${c.upper_bound}；冲突链：${chain}）。未提交内容已保留。`;
   } else {
@@ -1046,14 +925,14 @@ function showError(err) {
     S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
   }
   $('errorBanner').hidden = false;
-  // 成环：高亮环上节点
-  window._cycleHits = new Set(err.payload?.cycle || []);
+  // 成环：高亮环上节点（工作图草稿与 changeset 原样保留）
+  S._cycleHits = new Set(err.payload?.cycle || []);
   renderNodes();
   renderEdges();
 }
 function hideError() {
   $('errorBanner').hidden = true;
-  window._cycleHits = new Set();
+  S._cycleHits = new Set();
   S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
 }
 
@@ -1085,106 +964,113 @@ async function refreshVersions() {
   }
 }
 
-async function viewVersion(vid) {
-  const g = await api(`/api/versions/${vid}`);
-  S.work = snapshotFromServer(g);
+/**
+ * 进入只读视图（历史快照 / 提案 / 合并 / 归并预览）的统一入口。
+ * - 请求成功前不动任何编辑态；成功后先 captureEditSession() 原子保存，再切换到只读投影；
+ * - 投影 source/readonly 标记来源，nodes/edges 为冻结副本且按稳定 ID 顺序排列；
+ * - 退出 / 返回 / 失败由 exitReadOnly() 原子恢复，预览数据永不写回工作图。
+ */
+function enterReadOnly(graphData, state, source) {
+  const projection = makeProjection({
+    nodes: graphData.nodes, edges: graphData.edges,
+    version_id: graphData.version_id, source, readonly: true,
+  });
+  // 先保存（含未提交 changeset / 选中项 / 沙盘 / 高亮），再整体切换
+  if (!S.roSession) S.roSession = captureSession(S);
+  S.projection = projection;
+  S.viewingVersion = source === 'server' && state?.versionId != null ? state.versionId : null;
+  S.preview = source === 'server' ? null : state;
   S.selected = null;
-  S.viewingVersion = vid;
-  S.preview = null;
   S.mergeHits = { nodes: new Set(), edges: new Set() };
   S.nodeMerge = null;
-  $('nodeMergeModal').hidden = true;
   S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
+  S.localConflictHits = emptyHits();
+  S._cycleHits = new Set();
   clearAffected();
   resetSandbox();
   hideError();
   renderAll();
-  refreshVersions();
+  void refreshVersions();
 }
 
+/** 历史版本切换：先取数据再原子切换；请求失败时编辑态（含未提交修改）完全不动。 */
+async function viewVersion(vid) {
+  if (S.viewingVersion === vid) return;
+  try {
+    const g = await api(`/api/versions/${vid}`);
+    $('nodeMergeModal').hidden = true;
+    enterReadOnly(g, { versionId: vid }, 'server');
+  } catch (err) {
+    flashBanner('历史快照加载失败：' + err.message);
+  }
+}
+
+/**
+ * 退出只读视图：原子恢复进入前的工作图、未提交 changeset、选中项与沙盘状态。
+ * 不重新请求服务端（历史浏览期间当前版可能已变化，但「返回」只承诺还原本地编辑现场；
+ * 需要与服务端对齐时显式点刷新 / 重新进入当前版走 loadState）。
+ */
+function exitReadOnly() {
+  const snap = S.roSession;
+  if (!snap) return;
+  restoreSession(S, snap);
+  S.roSession = null;
+  S.viewingVersion = null;
+  S.preview = null;
+  rebuildWorkProjection();
+  hideError();
+  renderAll();
+  void refreshVersions();
+}
+
+/** 历史视图「返回当前版」：丢弃只读图，原子还原本地工作图现场。 */
 async function backToCurrent() {
-  await loadState();
+  if (S.roSession) exitReadOnly();
 }
 
 async function rollbackViewing() {
   if (!S.viewingVersion) return;
-  if (!confirm(`确定以 v${S.viewingVersion} 的内容生成一个新版本（回滚）？当前未提交修改与最新版将成为历史。`)) return;
+  if (S.roSession && changeCount() > 0) {
+    flashBanner('存在未提交修改：请先「返回当前版」提交或放弃后，再做历史回滚。');
+    return;
+  }
+  if (!confirm(`确定以 v${S.viewingVersion} 的内容生成一个新版本（回滚）？当前最新版将成为历史。`)) return;
+  const vid = S.viewingVersion;
   try {
     const res = await api('/api/versions/rollback', {
       method: 'POST',
-      body: JSON.stringify({ target_version_id: S.viewingVersion }),
+      body: JSON.stringify({ target_version_id: vid }),
     });
+    // 回滚产生新版本：清空本地未提交现场，按新当前版重建（类似正常提交后的 loadState）
+    S.roSession = null;
     toast(`已回滚，生成新版本 v${res.version_id}`);
     await loadState();
   } catch (err) {
+    // 失败：历史只读图与进入前的工作图现场都原样保留
     alert('回滚失败：' + err.message);
   }
 }
 
-// ---------- 下游影响 ----------
-
-function localDownstream(nodeId) {
-  // 本地 BFS，供未提交的图也能即时预览
-  const out = new Map();
-  for (const e of S.work.edges.values()) {
-    if (!out.has(e.source_id)) out.set(e.source_id, []);
-    out.get(e.source_id).push(e);
-  }
-  const depth = new Map([[nodeId, 0]]);
-  const q = [nodeId];
-  const edgeIds = new Set();
-  while (q.length) {
-    const u = q.shift();
-    for (const e of out.get(u) || []) {
-      edgeIds.add(e.id);
-      if (!depth.has(e.target_id)) { depth.set(e.target_id, depth.get(u) + 1); q.push(e.target_id); }
-    }
-  }
-  const layers = [];
-  for (const [nid, d] of depth) {
-    if (d === 0) continue;
-    while (layers.length < d) layers.push([]);
-    layers[d - 1].push(S.work.nodes.get(nid));
-  }
-  return { depth, edgeIds, layers };
-}
+// ---------- 下游影响（统一在活动投影上 BFS；高亮只接受投影计算结果） ----------
 
 async function computeImpact(nodeId) {
   const body = $('impactBody');
   body.innerHTML = '<p class="muted">计算中…</p>';
   try {
-    let data;
-    if (S.viewingVersion) {
-      data = await api(`/api/nodes/${encodeURIComponent(nodeId)}/downstream?version_id=${S.viewingVersion}`);
-    } else if (isReadOnly() || changeCount() > 0) {
-      // 提案 / 合并预览图与未提交工作图都只在本地：直接对当前画布图做 BFS
-      data = localImpactData(nodeId);
-      data.local = true;
-    } else {
-      data = await api(`/api/nodes/${encodeURIComponent(nodeId)}/downstream`);
-    }
+    // 当前版 / 未提交 / 历史 / 三类预览同一路径：对不可变投影做只读 BFS
+    const data = projectionDownstream(activeProjection(), null, nodeId);
+    data.local = true;  // 结果始终由前端投影计算（与后端同构）
+    data.source = activeProjection().source;
     renderImpact(nodeId, data);
   } catch (err) {
     body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
   }
 }
 
-function localImpactData(nodeId) {
-  const { depth, edgeIds, layers } = localDownstream(nodeId);
-  const affected = [...depth.keys()].filter((id) => id !== nodeId);
-  return {
-    node_id: nodeId,
-    node_title: S.work.nodes.get(nodeId).title,
-    affected_node_ids: affected,
-    total_affected: affected.length,
-    affected_events: affected.filter((id) => S.work.nodes.get(id)?.type === 'event').length,
-    affected_evidence: affected.filter((id) => S.work.nodes.get(id)?.type === 'evidence').length,
-    affected_edges: edgeIds.size,
-    max_depth: Math.max(0, ...depth.values()),
-    layers: layers.map((l) => l.filter(Boolean).map((n) => ({ id: n.id, type: n.type, title: n.title }))),
-    edges: [...edgeIds].map((id) => ({ id })),
-  };
-}
+const IMPACT_SOURCE_LABEL = {
+  work: '当前工作图（含未提交修改）', server: '当前版本',
+  proposal: '提案预览（只读）', merge: '合并预览（只读）', node_merge: '归并预览（只读）',
+};
 
 function renderImpact(nodeId, d) {
   clearAffected();
@@ -1194,7 +1080,7 @@ function renderImpact(nodeId, d) {
   renderEdges();
 
   $('impactBody').innerHTML = `
-    <div class="kv">根节点：<b>${esc(d.node_title)}</b>${d.local ? ' <span style="color:var(--evidence)">（基于未提交工作图）</span>' : ''}</div>
+    <div class="kv">根节点：<b>${esc(d.node_title)}</b>${d.local ? ` <span style="color:var(--evidence)">（基于${esc(IMPACT_SOURCE_LABEL[d.source] || '图投影')}本地重算）</span>` : ''}</div>
     <div class="impact-stat">
       <span class="stat-chip">受影响节点 <b>${d.total_affected}</b></span>
       <span class="stat-chip">事件 <b>${d.affected_events}</b></span>
@@ -1215,116 +1101,14 @@ function clearAffected() {
   S.affected = { nodes: new Set(), edges: new Set() };
 }
 
-// ---------- 反事实干预沙盘（与后端 graph.simulate_counterfactual 同构） ----------
+// ---------- 反事实干预沙盘（推演纯计算在投影层；对活动投影只读，本地与历史同构） ----------
 //
 // 只看「事件 + causes」子图：无前因事件默认发生；被显式勾选的干预点恒为 prevented；
 // ANY 门任一前因仍发生即发生，否则阻止；ALL 门全部前因均发生才发生。
 // 依据树：ANY 发生取 ID 最小仍发生前因 / 阻止列全部；
 //         ALL 发生列全部 / 阻止取 ID 最小已阻止前因；干预点不展开。
-function computeCounterfactual(nodes, edges, targetId, preventedIds) {
-  const events = new Set([...nodes.values()].filter((n) => n.type === 'event').map((n) => n.id));
-  const target = nodes.get(targetId);
-  if (!target) throw new Error(`观察目标不存在：${targetId}`);
-  if (target.type !== 'event') throw new Error('观察目标必须是事件节点');
-  const preventedSet = new Set(preventedIds);
-  for (const pid of preventedSet) {
-    const n = nodes.get(pid);
-    if (!n) throw new Error(`被阻止事件不存在：${pid}`);
-    if (n.type !== 'event') throw new Error(`被阻止节点必须是事件：${pid}`);
-  }
-
-  const parents = new Map([...events].map((id) => [id, []]));
-  const parentEdge = new Map();
-  for (const e of edges.values()) {
-    if (e.kind !== 'causes' || !events.has(e.source_id) || !events.has(e.target_id)) continue;
-    parents.get(e.target_id).push(e.source_id);
-    parentEdge.set(`${e.source_id}->${e.target_id}`, e.id);
-  }
-  for (const arr of parents.values()) arr.sort();
-
-  // Kahn 拓扑排序，初始队列按 id 排序，结果与 Map 遍历顺序无关
-  const children = new Map([...events].map((id) => [id, []]));
-  const indeg = new Map();
-  for (const [v, ps] of parents) {
-    indeg.set(v, ps.length);
-    for (const u of ps) children.get(u).push(v);
-  }
-  for (const arr of children.values()) arr.sort();
-  const q = [...events].filter((id) => indeg.get(id) === 0).sort();
-  const topo = [];
-  while (q.length) {
-    const u = q.shift(); topo.push(u);
-    for (const v of children.get(u)) {
-      indeg.set(v, indeg.get(v) - 1);
-      if (indeg.get(v) === 0) q.push(v);
-    }
-  }
-  if (topo.length !== events.size) throw new Error('因果图存在环，无法按拓扑顺序推演');
-
-  const intervened = new Set(preventedSet);
-  const status = new Map(), reason = new Map();
-  for (const id of topo) {
-    if (intervened.has(id)) { status.set(id, 'prevented'); reason.set(id, 'intervention'); continue; }
-    const ps = parents.get(id);
-    if (!ps.length) { status.set(id, 'still_active'); reason.set(id, 'no_causes'); continue; }
-    const mode = nodes.get(id).trigger_mode === 'ALL' ? 'ALL' : 'ANY';
-    const active = ps.filter((p) => status.get(p) === 'still_active');
-    const blocked = ps.filter((p) => status.get(p) === 'prevented');
-    if (mode === 'ANY') {
-      if (active.length) { status.set(id, 'still_active'); reason.set(id, 'any_active'); }
-      else { status.set(id, 'prevented'); reason.set(id, 'all_prevented'); }
-    } else {
-      if (!blocked.length) { status.set(id, 'still_active'); reason.set(id, 'all_active'); }
-      else { status.set(id, 'prevented'); reason.set(id, 'some_prevented'); }
-    }
-  }
-
-  const treeEdgeIds = new Set();
-  const buildTree = (id) => {
-    const out = {
-      node_id: id, title: nodes.get(id).title,
-      trigger_mode: nodes.get(id).trigger_mode === 'ALL' ? 'ALL' : 'ANY',
-      status: status.get(id), reason: reason.get(id), children: [],
-    };
-    const ps = parents.get(id);
-    if (reason.get(id) === 'intervention' || !ps.length) return out;
-    const active = ps.filter((p) => status.get(p) === 'still_active');
-    const blocked = ps.filter((p) => status.get(p) === 'prevented');
-    let childIds;
-    if (reason.get(id) === 'any_active') childIds = [active[0]];
-    else if (reason.get(id) === 'all_active') childIds = ps;
-    else if (reason.get(id) === 'all_prevented') childIds = ps;
-    else childIds = [blocked[0]];  // some_prevented
-    for (const p of childIds) {
-      const eid = parentEdge.get(`${p}->${id}`);
-      if (eid) treeEdgeIds.add(eid);
-      out.children.push(buildTree(p));
-    }
-    return out;
-  };
-
-  const evSorted = [...events].sort();
-  return {
-    target_id: targetId,
-    target_title: target.title,
-    target_status: status.get(targetId),
-    version_id: S.work.version_id,
-    intervened_ids: [...intervened].sort(),
-    prevented_ids: evSorted.filter((id) => status.get(id) === 'prevented'),
-    still_active_ids: evSorted.filter((id) => status.get(id) === 'still_active'),
-    events: evSorted.map((id) => ({
-      node_id: id, title: nodes.get(id).title,
-      trigger_mode: nodes.get(id).trigger_mode === 'ALL' ? 'ALL' : 'ANY',
-      status: status.get(id), reason: reason.get(id),
-      intervened: intervened.has(id),
-    })),
-    tree: buildTree(targetId),
-    tree_edge_ids: [...treeEdgeIds].sort(),
-  };
-}
-
 function sandboxEventNodes() {
-  return [...S.work.nodes.values()].filter((n) => n.type === 'event');
+  return [...activeProjection().nodes.values()].filter((n) => n.type === 'event');
 }
 
 /** 收集沙盘依据树中的全部节点 id（递归）。 */
@@ -1378,54 +1162,26 @@ function toggleSandboxOff() {
   renderEdges();
 }
 
-/** 当前沙盘是否应采用本地推演：未提交工作图（含未提交的 trigger_mode/拓扑变化）即时生效。 */
-function sandboxIsLocal() {
-  return isDirtyEditing();
-}
-
+/**
+ * 沙盘同步：一切推演都在**当前活动投影**上由前端同构引擎完成 —— 未提交工作图、
+ * 干净当前版、历史快照与三类预览走同一路径；只读投影保证推演绝不写库 / 不产生 changeset。
+ * （POST /api/counterfactual/simulate 仍保留为独立只读 API，供外部调用。）
+ */
 async function syncSandbox() {
   if (!S.sandbox.active) return;
   pruneSandboxSelection();
   const sb = S.sandbox;
-  if (!sb.targetId) { sb.result = null; return; }
-  // 未提交工作图 / 提案与合并预览：本地即时推演；历史快照 / 干净当前版：调服务端
-  if (sandboxIsLocal() || S.preview) {
-    try {
-      sb.result = computeCounterfactual(S.work.nodes, S.work.edges, sb.targetId, [...sb.prevented]);
-      sb.local = true;
-    } catch (err) {
-      sb.result = null;
-      $('sandboxResult').innerHTML = `<p class="muted small">${esc(err.message)}</p>`;
-      return;
-    }
-    renderSandboxResult();
+  if (!sb.targetId) { sb.result = null; renderSandboxResult(); return; }
+  sb.loading = false;
+  try {
+    sb.result = computeCounterfactual(activeProjection(), null, sb.targetId, [...sb.prevented]);
+    sb.local = true;
+  } catch (err) {
+    sb.result = null;
+    $('sandboxResult').innerHTML = `<p class="muted small">${esc(err.message)}</p>`;
     return;
   }
-  const seq = ++sb.seq;
-  sb.loading = true;
   renderSandboxResult();
-  try {
-    const res = await api('/api/counterfactual/simulate', {
-      method: 'POST',
-      body: JSON.stringify({
-        target_id: sb.targetId,
-        prevented_ids: [...sb.prevented],
-        ...(S.viewingVersion ? { version_id: S.viewingVersion } : {}),
-      }),
-    });
-    if (seq === sb.seq) {
-      sb.result = res;
-      sb.local = false;
-      sb.loading = false;
-      renderSandboxResult();
-    }
-  } catch (err) {
-    if (seq === sb.seq) {
-      sb.loading = false;
-      sb.result = null;
-      $('sandboxResult').innerHTML = `<p class="muted small">${esc(err.message)}</p>`;
-    }
-  }
 }
 
 // ---------- 沙盘面板渲染 ----------
@@ -1446,8 +1202,8 @@ function renderSandboxControls() {
   // 事件集合 / 模式未变时只更新勾选状态，避免重建列表打断交互
   if (sb.sig !== sig) {
     sb.sig = sig;
-    // 干净视图 / 历史快照下结构已变：服务端旧结果立即作废（本地模式随后会即时重算）
-    if (sb.active && !sandboxIsLocal()) clearSandboxResult();
+    // 结构 / 模式变化时旧依据树立即作废（renderAll 随后会按新投影即时重算）
+    if (sb.active) clearSandboxResult();
     const sel = $('sandboxTarget');
     sel.innerHTML = '';
     sel.appendChild(hEl('option', { value: '' }));
@@ -1524,6 +1280,10 @@ function renderSandboxResult() {
   }
   const r = sb.result;
   if (!r) return;
+  const p = activeProjection();
+  const basisLabel = isReadOnly()
+    ? (S.viewingVersion ? `基于历史快照 v${p.version_id}（只读）` : '基于只读预览图（未落库）')
+    : (isDirtyEditing() ? '基于未提交工作图' : `基于当前版 v${p.version_id}`);
   const targetCls = r.target_status === 'still_active' ? 'active' : 'prevented';
   const targetLabel = r.target_status === 'still_active' ? '仍发生 still_active' : '被阻止 prevented';
   box.innerHTML = `
@@ -1536,8 +1296,8 @@ function renderSandboxResult() {
       <span class="stat-chip">仍发生事件 <b>${r.still_active_ids.length}</b></span>
     </div>
     ${r.intervened_ids.length ? `<div class="muted small">干预点：
-      ${r.intervened_ids.map((id) => esc(S.work.nodes.get(id)?.title || id)).join('、')}</div>` : ''}
-    <div class="tree-title">目标递归依据树${sb.local ? '（基于未提交工作图）' : ''}</div>
+      ${r.intervened_ids.map((id) => esc(p.nodes.get(id)?.title || id)).join('、')}</div>` : ''}
+    <div class="tree-title">目标递归依据树（${esc(basisLabel)}）</div>
     <ul class="reason-tree">${sandboxTreeHtml(r.tree)}</ul>
     <p class="muted small">依据选择：ANY 发生取 ID 最小仍发生前因、阻止时列全部前因；
       ALL 发生列全部前因、阻止时取 ID 最小已阻止前因；无前因事件默认发生。</p>`;
@@ -1559,10 +1319,13 @@ function renderSandboxResult() {
 //       重算时间窗与证据审查并逐字段比对；摘要匹配且重算一致才显示「通过」。
 const pkg = { sig: '' };
 
-/** 导出可选的根事件：历史 / 提案预览的只读图取画布；否则取已提交当前版（未提交修改不纳入）。 */
+/** 导出可选的根事件：历史 / 三类预览的只读图取活动投影（稳定 ID 顺序）；
+ *  否则取已提交当前版原始快照（未提交修改不纳入导出）。 */
 function pkgEventNodes() {
-  const src = isReadOnly() ? [...S.work.nodes.values()] : (S.committed?.nodes || []);
-  return src.filter((n) => n.type === 'event')
+  if (isReadOnly()) {
+    return [...activeProjection().nodes.values()].filter((n) => n.type === 'event');
+  }
+  return (S.committed?.nodes || []).filter((n) => n.type === 'event')
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
@@ -2412,47 +2175,43 @@ async function saveProposal() {
   }
 }
 
-/** 单提案只读预览：画布载入「基线 + 该提案」的图。 */
+/** 单提案只读预览：画布载入「基线 + 该提案」的图（经不可变投影；预览不落库）。 */
 async function previewProposal(id) {
   try {
     proposalUI.detail = null;
     proposalUI.pair = null;
     const data = await api(`/api/proposals/${id}/preview`);
-    enterPreview(data.graph, {
+    enterReadOnly(data.graph, {
       kind: 'proposal',
       badge: `提案 #${id} 预览`,
       bannerText: `正在预览提案 #${id}「${data.proposal.title}」应用到基线 v${data.base_version_id} 的结果（只读，未落库）。`,
       id,
-    });
+    }, 'proposal');
     toast(`提案 #${id} 预览（不写库、不生成版本）`);
   } catch (err) {
+    // 请求失败：不触碰编辑会话（工作图 / changeset / 选中项 / 沙盘原样保留）
     flashBanner('预览失败：' + err.message);
   }
 }
 
+/** 三类预览（提案 / 合并 / 归并）的统一入口：只读投影 + 编辑会话原子保存。 */
 function enterPreview(graphData, state) {
-  S.work = snapshotFromServer(graphData);
-  S.selected = null;
-  S.viewingVersion = null;
-  S.preview = state;
-  S.mergeHits = { nodes: new Set(), edges: new Set() };
-  if (state.kind !== 'node_merge') S.nodeMerge = null;
-  S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
-  S.view = { ...S.view };  // 保留当前平移缩放，便于与编辑视图对照
-  clearAffected();
-  resetSandbox();
-  hideError();
-  renderAll();
-  refreshVersions();
+  const source = state.kind === 'proposal' ? 'proposal'
+    : state.kind === 'merge' ? 'merge' : 'node_merge';
+  enterReadOnly(graphData, state, source);
 }
 
-async function exitPreview() {
+/**
+ * 退出预览：原子恢复进入前的工作图 / 未提交 changeset / 选中项 / 沙盘状态。
+ * 裁决弹窗同时关闭；不重新请求服务端（预览从未写库，恢复的就是进入前现场）。
+ */
+function exitPreview() {
   if (!S.preview) return;
   $('mergeModal').hidden = true;
   $('nodeMergeModal').hidden = true;
   proposalUI.detail = null;
   nodeMergeUI.detail = null;
-  await loadState();
+  if (S.roSession) exitReadOnly();
 }
 
 /** 只收起裁决弹窗，保留画布上的合并预览（可点「返回裁决」继续）。 */
@@ -2640,27 +2399,28 @@ function updateMergeCommitState() {
   $('mergeMsg').className = 'muted small';
 }
 
-/** 冲突定位：收起弹窗，在画布上居中高亮对应节点 / 连线并选中。 */
+/** 冲突定位：收起弹窗，在画布上居中高亮对应节点 / 连线并选中（只读预览投影）。 */
 function locateConflict(c) {
+  const p = activeProjection();
   const hits = { nodes: new Set(), edges: new Set() };
   let center = null;
   if (c.subject === 'node') {
-    if (S.work.nodes.has(c.id)) {
+    if (p.nodes.has(c.id)) {
       hits.nodes.add(c.id);
       S.selected = { kind: 'node', id: c.id };
-      const n = S.work.nodes.get(c.id);
+      const n = p.nodes.get(c.id);
       center = { x: n.pos_x + NODE_W / 2, y: n.pos_y + NODE_H / 2 };
     }
   } else {
-    if (S.work.edges.has(c.id)) {
+    if (p.edges.has(c.id)) {
       hits.edges.add(c.id);
       S.selected = { kind: 'edge', id: c.id };
-      const e = S.work.edges.get(c.id);
-      const s = S.work.nodes.get(e.source_id), t = S.work.nodes.get(e.target_id);
+      const e = p.edges.get(c.id);
+      const s = p.nodes.get(e.source_id), t = p.nodes.get(e.target_id);
       if (s && t) center = { x: (s.pos_x + t.pos_x) / 2 + NODE_W / 2, y: (s.pos_y + t.pos_y) / 2 };
     }
-    if (c.source_id && S.work.nodes.has(c.source_id)) hits.nodes.add(c.source_id);
-    if (c.target_id && S.work.nodes.has(c.target_id)) hits.nodes.add(c.target_id);
+    if (c.source_id && p.nodes.has(c.source_id)) hits.nodes.add(c.source_id);
+    if (c.target_id && p.nodes.has(c.target_id)) hits.nodes.add(c.target_id);
   }
   S.mergeHits = hits;
   if (center) {
@@ -2911,7 +2671,8 @@ function nodeMergeFmtVal(v) {
 }
 
 function nodeMergeName(id) {
-  const n = S.work.nodes.get(id);
+  const p = activeProjection();
+  const n = p ? p.nodes.get(id) : null;
   return n ? n.title : (nodeMergeUI.detail?.candidate_titles?.[id] || id);
 }
 
@@ -3136,7 +2897,7 @@ function showNodeMergePreviewGraph(d) {
 }
 
 function centerOnNode(id) {
-  const n = S.work.nodes.get(id);
+  const n = activeProjection().nodes.get(id);
   if (!n) return;
   const r = svg.getBoundingClientRect();
   S.view.x = r.width / 2 - (n.pos_x + NODE_W / 2) * S.view.k;
@@ -3171,7 +2932,7 @@ function locateNodeMergeBlocker(index) {
     b.chain_edge_ids?.forEach((id) => edges.add(id));
   }
   // 预览图里已删除的重复节点不可见，过滤掉以免中心定位落空
-  const visible = [...nodes].filter((id) => S.work.nodes.has(id));
+  const visible = [...nodes].filter((id) => activeProjection().nodes.has(id));
   S.nodeMerge = { nodes: new Set(visible), edges };
   const first = visible[0];
   if (first) {
@@ -3307,7 +3068,8 @@ svg.addEventListener('pointermove', (ev) => {
     n.pos_x = Math.round(w.x - drag.dx);
     n.pos_y = Math.round(w.y - drag.dy);
     drag.moved = true;
-    // 拖动中只更新几何，不全量重建（避免吞事件）
+    // 拖动中只更新几何：重建工作投影（边端点按投影计算），不全量重建（避免吞事件）
+    rebuildWorkProjection();
     positionNodeGroup(drag.nodeId, n);
     renderEdges();
   } else if (drag.mode === 'connect') {
@@ -3546,3 +3308,11 @@ function bindUI() {
 
 bindUI();
 loadState().catch((err) => flashBanner('初始化失败：' + err.message));
+
+// 非浏览器环境（Node 回归测试用 vm 加载本脚本）暴露内部状态机；浏览器中无副作用。
+if (typeof window !== 'undefined' && window.__EXPOSE_APP_STATE__) {
+  window.__app = {
+    S, isReadOnly, rebuildWorkProjection, enterReadOnly, exitReadOnly,
+    computeCounterfactual, viewVersion, activeProjection,
+  };
+}

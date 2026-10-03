@@ -1,0 +1,8 @@
+{
+  "name": "incident-causal-graph-frontend",
+  "private": true,
+  "description": "前端不可变图投影层回归测试（无需浏览器，node --test）",
+  "scripts": {
+    "test": "node --test tests/"
+  }
+}
