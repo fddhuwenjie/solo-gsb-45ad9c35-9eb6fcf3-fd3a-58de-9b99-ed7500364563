@@ -1095,10 +1095,56 @@ curl -X POST http://localhost:8000/api/node-merge/commit \
 ├── static/
 │   ├── index.html    # 三栏布局：顶栏 / 画布 / 侧栏 + 评审室弹窗
 │   ├── style.css
+│   ├── projection.js # 不可变图投影层（纯 JS、无 DOM 依赖）：服务端快照 / 本地 changeset → 只读投影，稳定 ID 顺序、来源版本、只读标记；时间窗 / 证据审查 / 反事实 / 下游 BFS 只接受投影；只读视图栈与编辑会话（工作图 / changeset / 选中项 / 沙盘）原子捕获 / 恢复
 │   └── app.js        # 状态管理、SVG 渲染、拖拽/连线、changeset 累计与提交、结论包导出下载与核验展示、盲评建场/投票/封榜与矩阵视图、根因签发预检/签发/记录展示、变更提案保存/预览/三方比较裁决与冲突定位、重复事件归并候选选择/预览/字段取值/冲突路径定位与确认
+├── tests/
+│   ├── projection.test.js     # 投影层 Node 回归（node --test）：三类预览 / 历史切换 / 字段缺失 / changeset 重放 / 只读栈原子恢复
+│   └── api_previews_test.py   # API 回归（pytest）：单提案 / 三方合并 / 重复事件归并预览只读不落库、历史切换、缺字段证据
 ├── Dockerfile
 ├── docker-compose.yml
-└── requirements.txt
+├── requirements.txt          # 运行依赖
+└── requirements-dev.txt      # 测试依赖（pytest / httpx）
+```
+
+### 不可变图投影层（前端 `projection.js`）
+
+画布上看到的任何一张图都必须先变成一个**不可变图投影**（`GraphProjection`），入口只有两个：
+
+- **服务端快照**：当前版 `GET /api/state`、历史版本 `GET /api/versions/{id}`、单提案预览
+  `/api/proposals/{id}/preview`、三方合并预览 `/api/proposals/merge-preview`、重复事件归并预览
+  `/api/node-merge/preview` —— 经 `buildProjection(graph, {kind, readOnly})` 转成只读投影；
+- **本地 changeset**：`projectionFromChangeset(committed, changes)` 把未提交修改在**已提交基线**上
+  纯函数重放（顺序与后端 `graph.apply_changes` 一致：删节点级联删边 → 删边 → 更新 → 建节点 →
+  更新边 → 建边），得到唯一的可编辑工作投影。
+
+投影保证：
+
+- **来源版本** `meta.sourceVersion`、**只读标记** `meta.readOnly` 与 **kind**
+  （`history | proposal | merge | node_merge | editing`）；
+- **稳定 ID 顺序**：节点 / 连线按 id 排序，并暴露 `nodeOrder` / `edgeOrder`；节点、连线、承载
+  Map 与投影本身全部冻结（`set/delete/clear` 抛 `TypeError`），预览数据不可能就地写回工作图；
+- **字段缺失容错**：旧快照缺 `trigger_mode` / `description` / `reliability` 等字段按类型补默认值；
+  坏类型、重复 id、悬空端点、非法 kind 的节点 / 连线被剔除并在 `meta.dropped` 计数，绝不污染下游；
+- **下游只接受投影**：时间窗传播、证据强度审查、反事实拓扑推演、下游 BFS 都经
+  `requireProjection` 校验，派生结果按投影实例缓存（`WeakMap`），新投影自然失效。
+
+**只读视图栈 + 原子恢复**：进入历史 / 任一预览前先异步取数并构造投影，**构造失败绝不入栈、
+绝不触碰当前帧**；第一个只读帧入栈时原子捕获编辑会话（工作图、未提交 changeset、选中项、
+沙盘），历史 ↔ 预览、历史版本之间切换只替换只读帧、不覆盖检查点；「返回 / 退出」先**同步**
+从检查点恢复此前工作图、未提交 changeset、选中项与沙盘（不依赖网络，请求失败也能完整还原），
+再后台刷新当前版（版本号未变时保留未提交修改，有新版本才整体载入并提示）。提案与归并的裁决
+照常进行，但所有预览图都是只读投影，**预览不落库、不生成版本**。
+
+运行前端投影层回归测试（无需安装任何依赖，Node ≥ 18）：
+
+```bash
+node --test tests/projection.test.js
+```
+
+运行后端 API 回归测试（需要 `pip install -r requirements-dev.txt`，每个用例使用独立临时数据库）：
+
+```bash
+pytest -q tests/api_previews_test.py
 ```
 
 ### 数据模型（版本即快照）
